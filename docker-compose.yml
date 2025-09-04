@@ -1,0 +1,15 @@
+services:
+    postgres:
+        image: postgres:latest
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+        command: postgres -c log_statement=all
+        ports:
+            - "5432:5432"
+        environment:
+            - POSTGRES_USER=postgres
+            - POSTGRES_PASSWORD=postgres
+            - POSTGRES_DB=codecraft-repo
+
+volumes:
+    postgres_data:

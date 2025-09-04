@@ -1,0 +1,455 @@
+# name: CI/CD Pipeline
+
+# on:
+#     push:
+#         branches: ["main", "**"]
+
+# env:
+#     NODE_VERSION: "22"
+#     TERRAFORM_VERSION: "1.7.0"
+
+# jobs:
+#     detect-changes:
+#         name: Detect Changes
+#         runs-on: ubuntu-latest
+#         outputs:
+#             infra-changed: ${{ steps.filter.outputs.infra }}
+#             app-changed: ${{ steps.filter.outputs.app }}
+#             is-main: ${{ github.ref == 'refs/heads/main' }}
+
+#         steps:
+#             - uses: actions/checkout@v4
+
+#             - name: Check for file changes
+#               uses: dorny/paths-filter@v2
+#               id: filter
+#               with:
+#                   filters: |
+#                       infra:
+#                         - 'infra/**'
+#                       app:
+#                         - 'src/**'
+#                         - 'public/**'
+#                         - 'next.config.ts'
+#                         - 'package.json'
+
+#     terraform-deploy:
+#         name: Deploy Infrastructure
+#         needs: detect-changes
+#         if: needs.detect-changes.outputs.infra-changed == 'true' && needs.detect-changes.outputs.is-main == 'true'
+#         runs-on: ubuntu-latest
+#         outputs:
+#             database_url: ${{ steps.terraform-outputs.outputs.database_url }}
+#             preview_database_url: ${{ steps.terraform-outputs.outputs.preview_database_url }}
+#             neon_project_id: ${{ steps.terraform-outputs.outputs.neon_project_id }}
+#             auth_secret: ${{ steps.terraform-outputs.outputs.auth_secret }}
+#         defaults:
+#             run:
+#                 working-directory: ./infra
+#         env:
+#             TF_VAR_vercel_api_token: ${{ secrets.VERCEL_API_TOKEN }}
+#             TF_VAR_neon_api_key: ${{ secrets.NEON_API_KEY }}
+
+#         steps:
+#             - uses: actions/checkout@v4
+
+#             - name: Setup Terraform
+#               uses: hashicorp/setup-terraform@v3
+#               with:
+#                   terraform_version: ${{ env.TERRAFORM_VERSION }}
+#                   cli_config_credentials_token: ${{ secrets.TERRAFORM_API_TOKEN }}
+
+#             - name: Terraform Init & Validate
+#               run: |
+#                   terraform init
+#                   terraform validate
+
+#             - name: Terraform Plan & Apply
+#               run: |
+#                   terraform plan
+#                   terraform apply -auto-approve
+
+#             - name: Get Terraform Outputs & Update Secrets
+#               id: terraform-outputs
+#               run: |
+#                   # Get Terraform outputs
+#                   DATABASE_URL=$(terraform output -raw database_url)
+#                   PREVIEW_DATABASE_URL=$(terraform output -raw preview_database_url)
+#                   NEON_PROJECT_ID=$(terraform output -raw neon_project_id)
+
+#                   # Set job outputs
+#                   echo "database_url=$DATABASE_URL" >> $GITHUB_OUTPUT
+#                   echo "preview_database_url=$PREVIEW_DATABASE_URL" >> $GITHUB_OUTPUT
+#                   echo "neon_project_id=$NEON_PROJECT_ID" >> $GITHUB_OUTPUT
+
+#                   # Set GitHub secrets and variables for future runs
+#                   echo "$DATABASE_URL" | gh secret set DATABASE_URL
+#                   echo "$PREVIEW_DATABASE_URL" | gh secret set PREVIEW_DATABASE_URL
+#                   gh variable set NEON_PROJECT_ID --body "$NEON_PROJECT_ID"
+
+#                   # Generate AUTH_SECRET if it doesn't exist
+#                   if ! gh secret list | grep -q "AUTH_SECRET"; then
+#                     AUTH_SECRET=$(openssl rand -base64 64)
+#                     echo "$AUTH_SECRET" | gh secret set AUTH_SECRET
+#                     echo "Generated new AUTH_SECRET"
+#                     echo "auth_secret=$AUTH_SECRET" >> $GITHUB_OUTPUT
+#                   else
+#                     # If AUTH_SECRET exists, we can't read it back, so we'll use the secret
+#                     echo "auth_secret=" >> $GITHUB_OUTPUT
+#                   fi
+#               env:
+#                   GH_TOKEN: ${{ secrets.GH_PAT }}
+
+#     preview-deploy:
+#         name: Preview Deployment
+#         needs: detect-changes
+#         if: needs.detect-changes.outputs.app-changed == 'true' && needs.detect-changes.outputs.is-main == 'false'
+#         runs-on: ubuntu-latest
+
+#         steps:
+#             - uses: actions/checkout@v4
+
+#             - name: Setup pnpm & Node.js
+#               uses: pnpm/action-setup@v4
+#               with:
+#                   run_install: false
+
+#             - uses: actions/setup-node@v4
+#               with:
+#                   node-version: ${{ env.NODE_VERSION }}
+#                   cache: "pnpm"
+
+#             - name: Reset preview database
+#               uses: neondatabase/reset-branch-action@v1
+#               with:
+#                   project_id: ${{ vars.NEON_PROJECT_ID }}
+#                   parent: true
+#                   branch: preview
+#                   api_key: ${{ secrets.NEON_API_KEY }}
+
+#             - name: Install migration dependencies & run migrations
+#               run: |
+#                   node scripts/minimal-deps.js drizzle-kit drizzle-orm pg @t3-oss/env-core zod
+#                   pnpm drizzle-kit migrate
+#               env:
+#                   DATABASE_URL: ${{ secrets.PREVIEW_DATABASE_URL }}
+#                   SKIP_ENV_VALIDATION: "1"
+
+#             - name: Deploy to Vercel Preview
+#               run: |
+#                   pnpm install -g vercel@latest
+#                   vercel link --project codecraft-repo --yes --token ${{ secrets.VERCEL_API_TOKEN }}
+#                   vercel deploy \
+#                     --token ${{ secrets.VERCEL_API_TOKEN }} \
+#                     --yes --no-wait \
+#                     --env DATABASE_URL=${{ secrets.PREVIEW_DATABASE_URL }} \
+#                     --env AUTH_SECRET=${{ secrets.AUTH_SECRET }} \
+#                     --env NEXT_PUBLIC_ENV=production
+
+#     production-deploy:
+#         name: Production Deployment
+#         needs: [detect-changes, terraform-deploy]
+#         if: |
+#             needs.detect-changes.outputs.app-changed == 'true' &&
+#             needs.detect-changes.outputs.is-main == 'true' &&
+#             (needs.terraform-deploy.result == 'success' || needs.terraform-deploy.result == 'skipped')
+#         runs-on: ubuntu-latest
+#         steps:
+#             - uses: actions/checkout@v4
+
+#             - name: Setup pnpm & Node.js
+#               uses: pnpm/action-setup@v4
+#               with:
+#                   run_install: false
+
+#             - uses: actions/setup-node@v4
+#               with:
+#                   node-version: ${{ env.NODE_VERSION }}
+#                   cache: "pnpm"
+
+#             - name: Install migration dependencies & run migrations
+#               run: |
+#                   node scripts/minimal-deps.js drizzle-kit drizzle-orm pg @t3-oss/env-core zod
+#                   pnpm drizzle-kit migrate
+#               env:
+#                   # main deploys may have infrastructure changes and therefore a new database url may be needed, so it's better to check output before opting for secrets
+#                   DATABASE_URL: ${{ needs.terraform-deploy.outputs.database_url || secrets.DATABASE_URL }}
+#                   SKIP_ENV_VALIDATION: "1"
+
+#             - name: Deploy to Vercel Production
+#               run: |
+#                   pnpm install -g vercel@latest
+#                   vercel link --project codecraft-repo --yes --token ${{ secrets.VERCEL_API_TOKEN }}
+#                   vercel deploy \
+#                     --token ${{ secrets.VERCEL_API_TOKEN }} \
+#                     --yes --no-wait --prod \
+#                     --env DATABASE_URL=${{ needs.terraform-deploy.outputs.database_url || secrets.DATABASE_URL }} \
+#                     --env AUTH_SECRET=${{ needs.terraform-deploy.outputs.auth_secret || secrets.AUTH_SECRET }} \
+#                     --env NEXT_PUBLIC_ENV=production
+
+# #Note: You didn't use the -out option to save this plan, so Terraform can't guarantee to take exactly these actions if you run "terraform apply" now.
+
+name: CI/CD Pipeline
+on:
+    push:
+        branches: ["main", "**"]
+env:
+    NODE_VERSION: "22"
+    TERRAFORM_VERSION: "1.7.0"
+jobs:
+    detect-changes:
+        name: Detect Changes
+        runs-on: ubuntu-latest
+        outputs:
+            infra-changed: ${{ steps.filter.outputs.infra }}
+            app-changed: ${{ steps.filter.outputs.app }}
+            is-main: ${{ github.ref == 'refs/heads/main' }}
+        steps:
+            - uses: actions/checkout@v4
+            - name: Check for file changes
+              uses: dorny/paths-filter@v2
+              id: filter
+              with:
+                  filters: |
+                      infra:
+                        - 'infra/**'
+                      app:
+                        - 'src/**'
+                        - 'public/**'
+                        - 'next.config.ts'
+                        - 'package.json'
+    terraform-deploy:
+        name: Deploy Infrastructure
+        needs: detect-changes
+        if: needs.detect-changes.outputs.infra-changed == 'true' && needs.detect-changes.outputs.is-main == 'true'
+        runs-on: ubuntu-latest
+        outputs:
+            database_url: ${{ steps.terraform-outputs.outputs.database_url }}
+            preview_database_url: ${{ steps.terraform-outputs.outputs.preview_database_url }}
+            neon_project_id: ${{ steps.terraform-outputs.outputs.neon_project_id }}
+            auth_secret: ${{ steps.terraform-outputs.outputs.auth_secret }}
+            terraform_applied: ${{ steps.terraform-outputs.outputs.terraform_applied }}
+        defaults:
+            run:
+                working-directory: ./infra
+        env:
+            TF_VAR_vercel_api_token: ${{ secrets.VERCEL_API_TOKEN }}
+            TF_VAR_neon_api_key: ${{ secrets.NEON_API_KEY }}
+        steps:
+            - uses: actions/checkout@v4
+            - name: Setup Terraform
+              uses: hashicorp/setup-terraform@v3
+              with:
+                  terraform_version: ${{ env.TERRAFORM_VERSION }}
+                  cli_config_credentials_token: ${{ secrets.TERRAFORM_API_TOKEN }}
+                  terraform_wrapper: false
+            - name: Terraform Init & Validate
+              run: |
+                  terraform init
+                  terraform validate
+            - name: Terraform Plan & Apply
+              run: |
+                  terraform plan
+                  terraform apply -auto-approve
+            - name: Get Terraform Outputs & Update Secrets
+              id: terraform-outputs
+              run: |
+                  # Get Terraform outputs
+                  DATABASE_URL=$(terraform output -raw database_url)
+                  PREVIEW_DATABASE_URL=$(terraform output -raw preview_database_url)
+                  NEON_PROJECT_ID=$(terraform output -raw neon_project_id)
+
+                  # Verify outputs are not empty
+                  if [ -z "$DATABASE_URL" ]; then
+                    echo "Error: DATABASE_URL is empty"
+                    exit 1
+                  fi
+
+                  if [ -z "$PREVIEW_DATABASE_URL" ]; then
+                    echo "Error: PREVIEW_DATABASE_URL is empty"
+                    exit 1
+                  fi
+
+                  if [ -z "$NEON_PROJECT_ID" ]; then
+                    echo "Error: NEON_PROJECT_ID is empty"
+                    exit 1
+                  fi
+
+                  # Debug output lengths (without exposing values)
+                  echo "DATABASE_URL length: ${#DATABASE_URL}"
+                  echo "PREVIEW_DATABASE_URL length: ${#PREVIEW_DATABASE_URL}"
+                  echo "NEON_PROJECT_ID length: ${#NEON_PROJECT_ID}"
+
+                  # Mask sensitive values in GitHub Actions logs
+                  echo "::add-mask::$DATABASE_URL"
+                  echo "::add-mask::$PREVIEW_DATABASE_URL"
+
+                  # Set job outputs using GitHub's delimiter syntax for multiline values
+                  {
+                    echo "database_url<<EOF"
+                    echo "$DATABASE_URL"
+                    echo "EOF"
+                  } >> $GITHUB_OUTPUT
+
+                  {
+                    echo "preview_database_url<<EOF"
+                    echo "$PREVIEW_DATABASE_URL"
+                    echo "EOF"
+                  } >> $GITHUB_OUTPUT
+
+                  echo "neon_project_id=$NEON_PROJECT_ID" >> $GITHUB_OUTPUT
+                  echo "terraform_applied=true" >> $GITHUB_OUTPUT
+
+                  # Set GitHub secrets and variables for future runs
+                  echo "$DATABASE_URL" | gh secret set DATABASE_URL
+                  echo "$PREVIEW_DATABASE_URL" | gh secret set PREVIEW_DATABASE_URL
+                  gh variable set NEON_PROJECT_ID --body "$NEON_PROJECT_ID"
+
+                  # Generate AUTH_SECRET if it doesn't exist
+                  if ! gh secret list | grep -q "AUTH_SECRET"; then
+                    AUTH_SECRET=$(openssl rand -base64 64)
+                    echo "::add-mask::$AUTH_SECRET"
+                    echo "$AUTH_SECRET" | gh secret set AUTH_SECRET
+                    echo "Generated new AUTH_SECRET"
+                    {
+                      echo "auth_secret<<EOF"
+                      echo "$AUTH_SECRET"
+                      echo "EOF"
+                    } >> $GITHUB_OUTPUT
+                  else
+                    echo "AUTH_SECRET already exists, using existing secret"
+                    echo "auth_secret=" >> $GITHUB_OUTPUT
+                  fi
+              env:
+                  GH_TOKEN: ${{ secrets.GH_PAT }}
+    preview-deploy:
+        name: Preview Deployment
+        needs: detect-changes
+        if: needs.detect-changes.outputs.app-changed == 'true' && needs.detect-changes.outputs.is-main == 'false'
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: Setup pnpm & Node.js
+              uses: pnpm/action-setup@v4
+              with:
+                  run_install: false
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: ${{ env.NODE_VERSION }}
+                  cache: "pnpm"
+            - name: Reset preview database
+              uses: neondatabase/reset-branch-action@v1
+              with:
+                  project_id: ${{ vars.NEON_PROJECT_ID }}
+                  parent: true
+                  branch: preview
+                  api_key: ${{ secrets.NEON_API_KEY }}
+            - name: Debug Environment Variables
+              run: |
+                  echo "DATABASE_URL set: $([[ -n "$DATABASE_URL" ]] && echo "yes" || echo "no")"
+                  echo "DATABASE_URL length: ${#DATABASE_URL}"
+              env:
+                  DATABASE_URL: ${{ secrets.PREVIEW_DATABASE_URL }}
+            - name: Install migration dependencies & run migrations
+              run: |
+                  node scripts/minimal-deps.js drizzle-kit drizzle-orm pg @t3-oss/env-core zod
+                  pnpm drizzle-kit migrate
+              env:
+                  DATABASE_URL: ${{ secrets.PREVIEW_DATABASE_URL }}
+                  SKIP_ENV_VALIDATION: "1"
+            - name: Deploy to Vercel Preview
+              run: |
+                  pnpm install -g vercel@latest
+                  vercel link --project codecraft-repo --yes --token ${{ secrets.VERCEL_API_TOKEN }}
+                  vercel deploy \
+                    --token ${{ secrets.VERCEL_API_TOKEN }} \
+                    --yes --no-wait \
+                    --env DATABASE_URL="${{ secrets.PREVIEW_DATABASE_URL }}" \
+                    --env AUTH_SECRET="${{ secrets.AUTH_SECRET }}" \
+                    --env NEXT_PUBLIC_ENV=production
+    production-deploy:
+        name: Production Deployment
+        needs: [detect-changes, terraform-deploy]
+        if: |
+            needs.detect-changes.outputs.app-changed == 'true' &&
+            needs.detect-changes.outputs.is-main == 'true' &&
+            always() && !cancelled() && !failure()
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: Setup pnpm & Node.js
+              uses: pnpm/action-setup@v4
+              with:
+                  run_install: false
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: ${{ env.NODE_VERSION }}
+                  cache: "pnpm"
+            - name: Determine DATABASE_URL source
+              id: db-url
+              run: |
+                  if [ "${{ needs.terraform-deploy.outputs.terraform_applied }}" = "true" ] && [ -n "${{ needs.terraform-deploy.outputs.database_url }}" ]; then
+                    echo "Using fresh Terraform output"
+                    echo "source=terraform" >> $GITHUB_OUTPUT
+                    {
+                      echo "database_url<<EOF"
+                      echo "${{ needs.terraform-deploy.outputs.database_url }}"
+                      echo "EOF"
+                    } >> $GITHUB_OUTPUT
+                  else
+                    echo "Using existing GitHub secret"
+                    echo "source=secret" >> $GITHUB_OUTPUT
+                    {
+                      echo "database_url<<EOF"
+                      echo "${{ secrets.DATABASE_URL }}"
+                      echo "EOF"
+                    } >> $GITHUB_OUTPUT
+                  fi
+            - name: Determine AUTH_SECRET source
+              id: auth-secret
+              run: |
+                  if [ "${{ needs.terraform-deploy.outputs.terraform_applied }}" = "true" ] && [ -n "${{ needs.terraform-deploy.outputs.auth_secret }}" ]; then
+                    echo "Using fresh Terraform output"
+                    echo "source=terraform" >> $GITHUB_OUTPUT
+                    {
+                      echo "auth_secret<<EOF"
+                      echo "${{ needs.terraform-deploy.outputs.auth_secret }}"
+                      echo "EOF"
+                    } >> $GITHUB_OUTPUT
+                  else
+                    echo "Using existing GitHub secret"
+                    echo "source=secret" >> $GITHUB_OUTPUT
+                    {
+                      echo "auth_secret<<EOF"
+                      echo "${{ secrets.AUTH_SECRET }}"
+                      echo "EOF"
+                    } >> $GITHUB_OUTPUT
+                  fi
+            - name: Debug Environment Variables
+              run: |
+                  echo "DATABASE_URL source: ${{ steps.db-url.outputs.source }}"
+                  echo "AUTH_SECRET source: ${{ steps.auth-secret.outputs.source }}"
+                  echo "DATABASE_URL set: $([[ -n "$DATABASE_URL" ]] && echo "yes" || echo "no")"
+                  echo "DATABASE_URL length: ${#DATABASE_URL}"
+                  echo "AUTH_SECRET set: $([[ -n "$AUTH_SECRET" ]] && echo "yes" || echo "no")"
+                  echo "AUTH_SECRET length: ${#AUTH_SECRET}"
+              env:
+                  DATABASE_URL: ${{ steps.db-url.outputs.database_url }}
+                  AUTH_SECRET: ${{ steps.auth-secret.outputs.auth_secret }}
+            - name: Install migration dependencies & run migrations
+              run: |
+                  node scripts/minimal-deps.js drizzle-kit drizzle-orm pg @t3-oss/env-core zod
+                  pnpm drizzle-kit migrate
+              env:
+                  DATABASE_URL: ${{ steps.db-url.outputs.database_url }}
+                  SKIP_ENV_VALIDATION: "1"
+            - name: Deploy to Vercel Production
+              run: |
+                  pnpm install -g vercel@latest
+                  vercel link --project codecraft-repo --yes --token ${{ secrets.VERCEL_API_TOKEN }}
+                  vercel deploy \
+                    --token ${{ secrets.VERCEL_API_TOKEN }} \
+                    --yes --no-wait --prod \
+                    --env DATABASE_URL="${{ steps.db-url.outputs.database_url }}" \
+                    --env AUTH_SECRET="${{ steps.auth-secret.outputs.auth_secret }}" \
+                    --env NEXT_PUBLIC_ENV=production
